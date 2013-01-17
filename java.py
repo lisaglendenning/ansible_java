@@ -4,24 +4,29 @@ DOCUMENTATION = """
 ---
 module: java
 author: Lisa Glendenning
-short_description: Manage installation of Oracle Java 7 on Linux
+short_description: Manages installation of Oracle Java 7 on Linux
 description:
-    - Tested with Ansible v0.9
-    - Tested on Fedora 15 and Ubuntu 12
+    - Manage installation of Oracle Java 7 on Linux.
+#requirements: null
+#version_added: null
+notes:
+    - "Tested with Ansible v0.9."
+    - "Tested on 64-bit Fedora 15 and Ubuntu 12."
 options:
     state:
         description:
-            - jre: install JRE
-            - jdk: install JDK
-            - none: uninstall
-        required: no
+            - "whether to install JRE (I(jre)), install JDK (I(jdk)), or uninstall (I(none))"
+        required: false
         default: jre
         choices: [none, jre, jdk]
     package_location:
         description:
-            - non-standard location for packages
-        required: no
-        default: None
+            - "non-standard location for packages"
+        required: false
+        default: null
+examples:
+    - code: "java state=jdk"
+      description: "Install the latest JDK."
 """
 
 #############################################################################

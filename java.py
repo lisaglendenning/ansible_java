@@ -12,6 +12,7 @@ description:
 notes:
     - "Tested with Ansible v0.9."
     - "Tested on 64-bit Fedora 15 and Ubuntu 12."
+    - "Undefined behavior if mixed with other Java installations."
 options:
     state:
         description:
@@ -19,6 +20,12 @@ options:
         required: false
         default: jre
         choices: [none, jre, jdk]
+    version:
+        description:
+            - "Java version"
+        required: false
+        default: 7
+        choices: [6, 7]
     package_location:
         description:
             - "non-standard location for packages"
@@ -249,7 +256,7 @@ class AptRepository(object):
         self.apt.install(self.PACKAGE)
     
     def installed(self, repo):
-        args = "egrep -v '^#|^ *$' /etc/apt/sources.list /etc/apt/sources.list.d/*.list"
+        args = "grep -E -v '^#|^ *$' /etc/apt/sources.list /etc/apt/sources.list.d/*.list"
         result = self.module.run_command(args)
         for output in result[1].splitlines():
             filename, line = output.split(':', 1)
@@ -335,7 +342,7 @@ class Java(object):
     
     arguments = {
         'state': {'default': 'jre', 'choices': ['none', 'jre', 'jdk',],},
-        'version': {'default': '7', 'choices': ['7',],},
+        'version': {'default': '7', 'choices': ['6', '7',],},
         'vendor': {'default': 'Oracle', 'choices': ['Oracle',],},
         'package_location': {'default': None,}
     }
@@ -435,9 +442,13 @@ class Java(object):
         # uninstall current java
         if current_state != 'none':
             result['changed'] = bool(self.uninstall()) or result['changed']
+#            current_version = self.discover_version(module, current_state == 'jdk')
+#            assert not current_version, current_version
         
         if target_state != 'none':
             result['changed'] = bool(self.install(target_state, target_version)) or result['changed']
+            current_version = self.discover_version(module, target_state == 'jdk')
+            assert current_version and current_version >= target_version, current_version
         
         return result
 
@@ -447,30 +458,100 @@ class Java(object):
 class JavaApt(Java):
     
     JDK_REPO = 'ppa:webupd8team/java'
-    JDK_PACKAGE = 'oracle-java7-installer'
-    
+
     JRE_REPO = 'deb http://www.duinsoft.nl/pkg debs all'
     JRE_REPO_KEY = '5CB26B26'
     JRE_REPO_FILE = '/etc/apt/sources.list.d/duinsoft.list'
-    JRE_PACKAGE = 'update-sun-jre'
     
+    ENV_FILE = '/etc/environment'
+    ENV_PATTERN = r"^[:space]*JAVA_HOME[:space]*="
+    
+    @classmethod
+    def java_home(cls, version):
+        return '/usr/lib/jvm/java-%d-oracle' % version.major
+    
+    @classmethod
+    def java_package(cls, version, jdk=True):
+        if jdk:
+            name = 'oracle-java%d-installer' % version.major
+        else:
+            return 'update-sun-jre'
+        return name
+        
     def __init__(self, module):
         super(JavaApt, self).__init__(module)
         self.apt = Apt(module)
         self.aptrepo = AptRepository(module)
-
+            
+    def install_env(self, home):
+        pattern = self.ENV_PATTERN
+        argv = ['grep', '-E', "%s" % pattern, self.ENV_FILE]
+        result = self.module.run_command(argv)
+        if result[0] == 0:
+            output = [l for l in result[1].splitlines(True) if '=' in l]
+            assert len(output)
+            # assume that the latest value wins
+            kv = [w.strip() for w in output[-1].strip().split('=')]
+            assert kv[0] == 'JAVA_HOME'
+            if kv[1].strip('"') == home:
+                return False
+            
+            # delete existing JAVA_HOME
+            # it would be better to comment out, but unsure of file format
+            lines = []
+            with open(self.ENV_FILE, 'r') as f:
+                for line in f:
+                    if line not in output:
+                        lines.append(line)
+            
+            with open(self.ENV_FILE, 'w') as f:
+                f.writelines(lines)
+                
+        # append
+        with open('/etc/environment', 'a') as f:
+            f.write('JAVA_HOME="%s"\n' % home)
+        return True
+    
+    def uninstall_env(self, home=''):
+        pattern = self.ENV_PATTERN
+        if home:
+            pattern += r'[:space]*"?' + home + r'"?[:space]*$'
+        argv = ['grep', '-E', "%s" % pattern, self.ENV_FILE]
+        result = self.module.run_command(argv)
+        if result[0] == 0:
+            output = [l for l in result[1].splitlines(True) if '=' in l]
+            assert len(output)
+            lines = []
+            with open(self.ENV_FILE, 'r') as f:
+                for line in f:
+                    if line not in output:
+                        lines.append(line)
+            with open(self.ENV_FILE, 'w') as f:
+                f.writelines(lines)
+            return True
+        else:
+            return False
+        
     def install_jdk(self, target_version):
-        changed = self.aptrepo.install(self.JDK_REPO)
-        if not self.apt.installed(self.JDK_PACKAGE):
+        changed = False
+        repo = self.JDK_REPO
+        changed = self.aptrepo.install(repo) or changed
+        pkg = self.java_package(target_version, True)
+        if not self.apt.installed(pkg):
             # accept Oracle license
-            args = "echo oracle-java7-installer shared/accepted-oracle-license-v1-1 select true | /usr/bin/debconf-set-selections"
+            args = " | ".join(("echo %s shared/accepted-oracle-license-v1-1 select true" % pkg,
+                               "/usr/bin/debconf-set-selections"))
             self.module.run_command(args, True)
-        changed = self.apt.install(self.JDK_PACKAGE) or changed
+        changed = self.apt.install(pkg) or changed
         return changed
     
     def uninstall_jdk(self):
-        changed = self.apt.uninstall(self.JDK_PACKAGE)
-        changed = self.aptrepo.uninstall(self.JDK_REPO) or changed
+        changed = False
+        for version in self.arguments['version']['choices']:
+            pkg = self.java_package(JavaVersion.from_string(version), True)
+            changed = self.apt.uninstall(pkg) or changed
+        repo = self.JDK_REPO
+        changed = self.aptrepo.uninstall(repo) or changed
         return changed
         
     def install_jre(self, target_version):
@@ -486,11 +567,16 @@ class JavaApt(Java):
         if changed:
             self.apt.update()
         
-        changed = self.apt.install(self.JRE_PACKAGE) or changed
+        pkg = self.java_package(target_version, False)
+        changed = self.apt.install(pkg) or changed
         return changed
         
     def uninstall_jre(self):
-        changed = self.apt.uninstall(self.JRE_PACKAGE)
+        changed = False
+        for version in self.arguments['version']['choices']:
+            pkg = self.java_package(JavaVersion.from_string(version), False)
+            changed = self.apt.uninstall(pkg) or changed
+        
         if os.path.isfile(self.JRE_REPO_FILE):
             os.remove(self.JRE_REPO_FILE)
             changed = True
@@ -502,17 +588,22 @@ class JavaApt(Java):
         return changed
     
     def install(self, target_state, target_version):
+        changed = False
+        self.apt.update()
         if target_state == 'jdk':
-            changed = self.install_jdk(target_version)
+            changed = self.install_jdk(target_version) or changed
         elif target_state == 'jre':
-            changed = self.install_jre(target_version)
+            changed = self.install_jre(target_version) or changed
         else:
             raise ValueError(target_state)
+        changed = self.install_env(self.java_home(target_version)) or changed
         return changed
         
     def uninstall(self):
-        changed = self.uninstall_jdk()
+        changed = False
+        changed = self.uninstall_jdk() or changed
         changed = self.uninstall_jre() or changed
+        changed = self.uninstall_env() or changed
         return changed
     
 super(JavaApt, JavaApt).subclasses[('Ubuntu',)] = JavaApt
@@ -521,6 +612,10 @@ super(JavaApt, JavaApt).subclasses[('Ubuntu',)] = JavaApt
 #############################################################################
 
 class JavaYum(Java):
+    # For later:
+    # http://www.rackspace.com/knowledge_center/article/how-to-install-the-oracle-jdk-on-fedora-15-16
+    # https://github.com/p120ph37/java-1.7.0-sun-compat
+    
     # FIXME: get latest versions dynamically
     LATEST_VERSION = JavaVersion(7, 0, 11, 21)
     
@@ -606,8 +701,7 @@ super(JavaYum, JavaYum).subclasses[('Fedora',)] = JavaYum
 #############################################################################
 #############################################################################
 
-# hack because Ansible 0.9 doesn't include this function
-
+# because Ansible 0.9 doesn't include this function
 def run_command(self, args, check_rc=False, close_fds=False, executable=None):
     '''
     Execute a command, returns rc, stdout, and stderr.

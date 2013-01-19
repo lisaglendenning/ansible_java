@@ -4,9 +4,9 @@ DOCUMENTATION = """
 ---
 module: java
 author: Lisa Glendenning
-short_description: Manages installation of Oracle Java 7 on Linux
+short_description: Manages installation of Oracle Java 6/7 on Linux
 description:
-    - Manage installation of Oracle Java 7 on Linux.
+    - Manage installation of Oracle Java 6/7 on Linux.
 #requirements: null
 #version_added: null
 notes:
@@ -30,7 +30,7 @@ options:
         description:
             - "non-standard location for packages"
         required: false
-        default: null
+        default: None
 examples:
     - code: "java state=jdk"
       description: "Install the latest JDK."
@@ -44,6 +44,8 @@ import re
 import platform
 import tempfile
 import traceback
+import stat
+import shutil
 from collections import namedtuple
 
 # just for run_command hack
@@ -76,7 +78,6 @@ class Download(object):
         argv.extend(opts)
         argv.append(url)
         argv.append('--output-document=%s' % dest)
-        
         result = self.module.run_command(argv)
         if result[0] != 0:
             raise RuntimeError('Error: Download returned %d: %s' % (result[0], argv))
@@ -302,9 +303,10 @@ class JavaVersion(namedtuple('JavaVersion', 'major, minor, release, build')):
         % (MAJOR_PATTERN, MINOR_PATTERN, RELEASE_PATTERN, BUILD_PATTERN)
     UPDATE_PATTERN = r'^%s(?:u%s%s?)?$' \
         % (MAJOR_PATTERN, RELEASE_PATTERN, BUILD_PATTERN)
-        
-    UPDATE_TEMPLATE = r'%(major)su%(release)s'
-    BUILD_TEMPLATE = UPDATE_TEMPLATE + '-b%(build)s'
+    
+    VERSION_TEMPLATE = r'1.%(major)d.%(minor)d_%(release)d'
+    UPDATE_TEMPLATE = r'%(major)du%(release)d'
+    BUILD_TEMPLATE = UPDATE_TEMPLATE + '-b%(build)02d'
     
     @classmethod
     def from_string(cls, text):
@@ -327,6 +329,9 @@ class JavaVersion(namedtuple('JavaVersion', 'major, minor, release, build')):
     def __new__(cls, major=None, minor=None, release=None, build=None):
         return super(JavaVersion, cls).__new__(cls, major, minor, release, build)
     
+    def version_string(self):
+        return self.VERSION_TEMPLATE % self._asdict()
+    
     def update_string(self):
         return self.UPDATE_TEMPLATE % self._asdict()
     
@@ -338,6 +343,25 @@ class JavaVersion(namedtuple('JavaVersion', 'major, minor, release, build')):
 
 class Java(object):
     
+    # see https://forums.oracle.com/forums/thread.jspa?messageID=10563534
+    ORACLE_COOKIE = 'Cookie: gpw_e24=http%3A%2F%2Fwww.oracle.com%2F'
+    ORACLE_DOWNLOAD_URL = 'http://download.oracle.com/otn-pub/java/jdk/'
+    SUN_DOWNLOAD_URL = 'http://javadl.sun.com/webapps/download/AutoDL?BundleId='
+    SUN_DOWNLOAD_IDS = {
+        7: { 'x64': {'rpm': 73133, 'bin': 73134,}, 
+             'i586': {'rpm': 73131, 'bin': 73132,},},
+        6: { 'x64': {'rpm': 71304, 'bin': 71305,}, 
+             'i586': {'rpm': 71302, 'bin': 71303,},},
+    }
+    
+    JAVA_HOME = '/usr/lib/jvm'
+    
+    # TODO: get latest versions dynamically
+    LATEST_VERSION = { 
+        7: JavaVersion(7, 0, 11, 21),
+        6: JavaVersion(6, 0, 38, 5),
+    }
+    
     subclasses = {}
     
     arguments = {
@@ -346,6 +370,26 @@ class Java(object):
         'vendor': {'default': 'Oracle', 'choices': ['Oracle',],},
         'package_location': {'default': None,}
     }
+    
+    @classmethod
+    def select_subclass(cls):
+        plat = platform.system()
+        if plat == 'Linux':
+            try:
+                dist = platform.linux_distribution()[0].capitalize()
+            except:
+                # FIXME: MethodMissing, I assume?
+                dist = platform.dist()[0].capitalize()
+        else:
+            raise RuntimeError('Platform %s not supported' % plat)
+
+        subcls = None
+        for dists, subcls in cls.subclasses.iteritems():
+            if dist in dists:
+                break
+        else:
+            raise RuntimeError('Distribution %s not supported' % dist)
+        return subcls
     
     @classmethod
     def discover_version(cls, module, jdk=False):
@@ -369,28 +413,79 @@ class Java(object):
     
     @classmethod
     def discover_arch(cls):
-        return platform.machine()
+        return 'x64' if platform.machine() == 'x86_64' else 'i586'
     
     @classmethod
-    def select_subclass(cls):
-        plat = platform.system()
-        if plat == 'Linux':
-            try:
-                dist = platform.linux_distribution()[0].capitalize()
-            except:
-                # FIXME: MethodMissing, I assume?
-                dist = platform.dist()[0].capitalize()
-        else:
-            raise RuntimeError('Platform %s not supported' % plat)
-
-        subcls = None
-        for dists, subcls in cls.subclasses.iteritems():
-            if dist in dists:
-                break
-        else:
-            raise RuntimeError('Distribution %s not supported' % dist)
-        return subcls
+    def sun_url(cls, target_version, rpm=False):
+        version = target_version.major
+        if version not in cls.SUN_DOWNLOAD_IDS:
+            raise NotImplementedError
+        arch = cls.discover_arch()
+        suffix = 'rpm' if rpm else 'bin'
+        bundleid = cls.SUN_DOWNLOAD_IDS[version][arch][suffix]
+        url = cls.SUN_DOWNLOAD_URL + str(bundleid)
+        return url
     
+    @classmethod
+    def oracle_file(cls, version, jdk=False, rpm=False):
+        arch = cls.discover_arch()
+        prefix = 'jdk' if jdk else 'jre'
+        if version.major == 7:
+            suffix = '.rpm' if rpm else '.tar.gz'
+        elif version.major == 6:
+            suffix = '-rpm.bin' if rpm else '.bin'
+        else:
+            raise NotImplementedError
+        filename = '%s-%s-linux-%s%s' \
+            % (prefix, version.update_string(), arch, suffix)
+        return filename
+        
+    @classmethod
+    def oracle_url(cls, target_version, jdk=False, rpm=False):
+        if target_version.major not in cls.LATEST_VERSION:
+            raise NotImplementedError
+        version = cls.LATEST_VERSION[target_version.major]
+        url = cls.ORACLE_DOWNLOAD_URL \
+            + version.build_string() \
+            + '/' + cls.oracle_file(version, jdk, rpm)
+        return url
+    
+    @classmethod
+    def java_home(cls, version, jdk=False):
+        latest = cls.LATEST_VERSION[version.major]
+        return os.path.join(cls.JAVA_HOME, 
+                            ('jdk' if jdk else 'jre') + latest.version_string())
+    
+    @classmethod
+    def fetch(cls, module, target_version, jdk=False, rpm=False):
+        url = cls.oracle_url(target_version, jdk, rpm)
+        filename = url.rsplit('/', 1)[1]
+        
+        source = None
+        if module.params['package_location']:
+            source = module.params['package_location']
+            if source.startswith('/') and not source.endswith('/'):
+                source += '/'
+        else:
+            # for JRE, prefer sun url
+            if not jdk:
+                url = cls.sun_url(target_version, rpm)
+            source = url
+        if source.endswith('/'):
+            source += filename
+        
+        dest = None
+        if source.startswith('/'): # assume local file
+            dest = source
+        else: # assume url
+            download = Download(module)
+            if url.startswith(cls.ORACLE_DOWNLOAD_URL):
+                opts = ('-c', '--no-cookies', '--header', cls.ORACLE_COOKIE,)
+            else:
+                opts = None
+            dest = download.fetch(source, opts=opts, destfile=filename)
+        return dest
+        
     @classmethod
     def main(cls, module, *args, **kwargs):
         subcls = cls.select_subclass()
@@ -399,12 +494,68 @@ class Java(object):
 
     def __init__(self, module):
         self.module = module
-    
+
     def install(self, target_state, target_version):
-        raise NotImplementedError
+        module = self.module
+        jdk = target_state=='jdk'
+        rpm = False
+        source = self.fetch(module, target_version, jdk, rpm)
+        sourcedir = os.path.split(source)[0]
+        
+        dest = self.java_home(target_version, jdk)
+        destdir, destfile = os.path.split(dest)
+        o755 = stat.S_IRWXU | stat.S_IRGRP | stat.S_IXGRP | stat.S_IROTH | stat.S_IXOTH
+        if not os.path.exists(os.path.join(sourcedir, destfile)):
+            cwd = os.getcwd()
+            os.chdir(sourcedir)
+            if source.endswith('.bin'):
+                os.chmod(source, o755)
+                argv = [source]
+                module.run_command(argv, True)
+            elif source.endswith('.tar.gz'):
+                argv = ['tar', 'xzf', source]
+                module.run_command(argv, True)
+            else:
+                raise NotImplementedError
+            os.chdir(cwd)
+        
+        source = os.path.join(sourcedir, destfile)
+        assert os.path.isdir(source)
+        if not os.path.isdir(destdir):
+            os.makedirs(destdir, o755)
+        if not os.path.exists(dest):
+            shutil.move(source, dest)
+        for cmd in (['java'] + (['javac'] if target_state == 'jdk' else [])):
+            argv = ['update-alternatives', '--install', 
+                    '/usr/bin/%s' % cmd, cmd,
+                    os.path.join(dest, 'bin', cmd), '1']
+            module.run_command(argv, True)
+            argv = ['update-alternatives', '--set', cmd,
+                    os.path.join(dest, 'bin', cmd),]
+            module.run_command(argv, True)
+            
+        return True
     
-    def uninstall(self):
-        raise NotImplementedError
+    def uninstall(self, purge=False):
+        changed = False
+        module = self.module
+        dest = self.JAVA_HOME
+        if purge:
+            if os.path.exists(dest):
+                shutil.rmtree(dest)
+                changed = True
+            
+        for cmd in ('java', 'javac',):
+            argv = ['update-alternatives', '--list', cmd,]
+            result = module.run_command(argv)
+            if result[0] == 0:
+                for path in result[1].splitlines():
+                    if path.startswith(dest):
+                        argv = ['update-alternatives', '--remove', cmd, path,]
+                        module.run_command(argv, True)
+                        changed = True
+
+        return changed
     
     def apply(self):
         module = self.module
@@ -455,10 +606,15 @@ class Java(object):
 #############################################################################
 #############################################################################
 
+# For JRE 6, I tried to use https://github.com/flexiondotorg/oab-java6
+# but I ran into problems with ia32-libs on my test machine
+# so for now, JRE 6 install is manual
 class JavaApt(Java):
     
+    # For JDK 6/7
     JDK_REPO = 'ppa:webupd8team/java'
 
+    # FOR JRE 7
     JRE_REPO = 'deb http://www.duinsoft.nl/pkg debs all'
     JRE_REPO_KEY = '5CB26B26'
     JRE_REPO_FILE = '/etc/apt/sources.list.d/duinsoft.list'
@@ -467,8 +623,12 @@ class JavaApt(Java):
     ENV_PATTERN = r"^[:space]*JAVA_HOME[:space]*="
     
     @classmethod
-    def java_home(cls, version):
-        return '/usr/lib/jvm/java-%d-oracle' % version.major
+    def java_home(cls, version, jdk=False):
+        if jdk:
+            return os.path.join(cls.JAVA_HOME, 
+                                'java-%d-oracle' % version.major)
+        else:
+            return super(JavaApt, cls).java_home(version, jdk)
     
     @classmethod
     def java_package(cls, version, jdk=True):
@@ -556,19 +716,24 @@ class JavaApt(Java):
         
     def install_jre(self, target_version):
         changed = False
-        if not os.path.isfile(self.JRE_REPO_FILE):
-            with open(self.JRE_REPO_FILE, 'w') as f:
-                f.write(self.JRE_REPO)
-                f.write('\n')
-            changed = True
-    
-        aptkey = AptKey(self.module)
-        changed = aptkey.install(self.JRE_REPO_KEY) or changed
-        if changed:
-            self.apt.update()
+        if target_version.major == 7:
+            if not os.path.isfile(self.JRE_REPO_FILE):
+                with open(self.JRE_REPO_FILE, 'w') as f:
+                    f.write(self.JRE_REPO)
+                    f.write('\n')
+                changed = True
         
-        pkg = self.java_package(target_version, False)
-        changed = self.apt.install(pkg) or changed
+            aptkey = AptKey(self.module)
+            changed = aptkey.install(self.JRE_REPO_KEY) or changed
+            if changed:
+                self.apt.update()
+            
+            pkg = self.java_package(target_version, False)
+            changed = self.apt.install(pkg) or changed
+        elif target_version.major == 6:
+            changed = super(JavaApt, self).install('jre', target_version)
+        else:
+            raise NotImplementedError
         return changed
         
     def uninstall_jre(self):
@@ -584,6 +749,8 @@ class JavaApt(Java):
             
         aptkey = AptKey(self.module)
         changed = aptkey.uninstall(self.JRE_REPO_KEY) or changed
+        
+        changed = super(JavaApt, self).uninstall() or changed
 
         return changed
     
@@ -592,11 +759,14 @@ class JavaApt(Java):
         self.apt.update()
         if target_state == 'jdk':
             changed = self.install_jdk(target_version) or changed
+            jdk = True
         elif target_state == 'jre':
             changed = self.install_jre(target_version) or changed
+            jdk = False
         else:
             raise ValueError(target_state)
-        changed = self.install_env(self.java_home(target_version)) or changed
+        home = self.java_home(target_version, jdk)
+        changed = self.install_env(home) or changed
         return changed
         
     def uninstall(self):
@@ -616,84 +786,42 @@ class JavaYum(Java):
     # http://www.rackspace.com/knowledge_center/article/how-to-install-the-oracle-jdk-on-fedora-15-16
     # https://github.com/p120ph37/java-1.7.0-sun-compat
     
-    # FIXME: get latest versions dynamically
-    LATEST_VERSION = JavaVersion(7, 0, 11, 21)
-    
-    JDK_URL = 'http://download.oracle.com/otn-pub/java/jdk/'
-    JDK_COOKIE = 'Cookie: gpw_e24=http%3A%2F%2Fwww.oracle.com%2F'
-    
-    JRE_X64_URL = 'http://javadl.sun.com/webapps/download/AutoDL?BundleId=73133'
-    JRE_X86_URL = 'http://javadl.sun.com/webapps/download/AutoDL?BundleId=73131'
-    
     def __init__(self, module):
         super(JavaYum, self).__init__(module)
         self.yum = Yum(module)
-        self.download = Download(module)
-        
-    def uninstall_jdk(self):
-        return self.yum.uninstall('jdk')
-    
-    def uninstall_jre(self):
-        return self.yum.uninstall('jre')
-    
-    def install_jdk(self, target_version):
-        # see https://forums.oracle.com/forums/thread.jspa?messageID=10563534
-        version = self.LATEST_VERSION
-        arch = 'x64' if self.discover_arch() == 'x86_64' else 'i586'
-        filename = 'jdk-%s-linux-%s.rpm' % (version.update_string(), arch)
-        
-        source = None
-        if self.module.params['package_location']:
-            source = self.module.params['package_location']
-        else:
-            source = '%s%s/' % (self.JDK_URL, version.build_string())
-        if source.endswith('/'):
-            source += filename
-        
-        dest = None
-        if source.startswith('/'): # assume local file
-            dest = source
-        else: # assume url
-            opts = ('-c', '--no-cookies', '--header', self.JDK_COOKIE,)
-            dest = self.download.fetch(source, opts=opts, destfile=filename)
-        
-        self.yum.install(dest)
-        return True
-      
-    def install_jre(self, target_version):
-        version = self.LATEST_VERSION
-        arch = 'x64' if self.discover_arch() == 'x86_64' else 'i586'
-        filename = 'jre-%s-linux-%s.rpm' % (version.update_string(), arch)
-        
-        source = None
-        if self.module.params['package_location']:
-            source = self.module.params['package_location']
-        else:
-            source = self.JRE_X64_URL if arch == 'x64' else self.JRE_X86_URL
-        if source.endswith('/'):
-            source += filename
 
-        dest = None
-        if source.startswith('/'): # assume local file
-            dest = source
-        else: # assume url
-            dest = self.download.fetch(source, destfile=filename)
-            
-        self.yum.install(dest)
-        return True
-        
     def install(self, target_state, target_version):
-        if target_state == 'jdk':
-            changed = self.install_jdk(target_version)
-        elif target_state == 'jre':
-            changed = self.install_jre(target_version)
-        else:
-            raise ValueError(target_state)
+        module = self.module
+        jdk = target_state == 'jdk'
+        rpm = True
+        source = self.fetch(self.module, target_version, jdk, rpm)
+        if source.endswith('.bin'):
+            sourcedir, sourcefile = os.path.split(source)
+            # just to be difficult, the 64bit -rpm.bin from java.com
+            # turns into a file with amd64 in the name
+            if target_version.major == 6 and self.discover_arch() == 'x64':
+                destfile = sourcefile.replace('-x64-rpm.bin', '-amd64.rpm')
+            else:
+                destfile = sourcefile.replace('-rpm.bin', '.rpm')
+            dest = os.path.join(sourcedir, destfile)
+            if not os.path.exists(dest): 
+                o755 = stat.S_IRWXU | stat.S_IRGRP | stat.S_IXGRP | stat.S_IROTH | stat.S_IXOTH
+                os.chmod(source, o755)
+                cwd = os.getcwd()  
+                os.chdir(sourcedir)
+                argv = [source]
+                module.run_command(argv, True)
+                os.chdir(cwd)
+                assert os.path.exists(dest)
+            source = dest
+        changed = self.yum.install(source)
         return changed
         
     def uninstall(self):
-        changed = self.uninstall_jdk()
-        changed = self.uninstall_jre() or changed
+        changed = False
+        pkgs = ['jdk', 'jre']
+        for pkg in pkgs:
+            changed = self.yum.uninstall(pkg) or changed
         return changed
     
 super(JavaYum, JavaYum).subclasses[('Fedora',)] = JavaYum

@@ -7,11 +7,12 @@ author: Lisa Glendenning
 short_description: Manages installation of Oracle Java 6/7 on Linux
 description:
     - Manage installation of Oracle Java 6/7 on Linux.
-#requirements: null
+requirements:
+    - wget
 #version_added: null
 notes:
     - "Tested with Ansible v0.9."
-    - "Tested on 64-bit Fedora 15 and Ubuntu 12."
+    - "Tested on 64-bit Fedora 15,18 and Ubuntu 12."
     - "Undefined behavior if mixed with other Java installations."
 options:
     state:

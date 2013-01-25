@@ -610,7 +610,7 @@ class Java(object):
 # For JRE 6, I tried to use https://github.com/flexiondotorg/oab-java6
 # but I ran into problems with ia32-libs on my test machine
 # so for now, JRE 6 install is manual
-class JavaApt(Java):
+class JavaDeb(Java):
     
     # For JDK 6/7
     JDK_REPO = 'ppa:webupd8team/java'
@@ -629,7 +629,7 @@ class JavaApt(Java):
             return os.path.join(cls.JAVA_HOME, 
                                 'java-%d-oracle' % version.major)
         else:
-            return super(JavaApt, cls).java_home(version, jdk)
+            return super(JavaDeb, cls).java_home(version, jdk)
     
     @classmethod
     def java_package(cls, version, jdk=True):
@@ -640,7 +640,7 @@ class JavaApt(Java):
         return name
         
     def __init__(self, module):
-        super(JavaApt, self).__init__(module)
+        super(JavaDeb, self).__init__(module)
         self.apt = Apt(module)
         self.aptrepo = AptRepository(module)
             
@@ -732,7 +732,7 @@ class JavaApt(Java):
             pkg = self.java_package(target_version, False)
             changed = self.apt.install(pkg) or changed
         elif target_version.major == 6:
-            changed = super(JavaApt, self).install('jre', target_version)
+            changed = super(JavaDeb, self).install('jre', target_version)
         else:
             raise NotImplementedError
         return changed
@@ -751,7 +751,7 @@ class JavaApt(Java):
         aptkey = AptKey(self.module)
         changed = aptkey.uninstall(self.JRE_REPO_KEY) or changed
         
-        changed = super(JavaApt, self).uninstall() or changed
+        changed = super(JavaDeb, self).uninstall() or changed
 
         return changed
     
@@ -777,18 +777,18 @@ class JavaApt(Java):
         changed = self.uninstall_env() or changed
         return changed
     
-super(JavaApt, JavaApt).subclasses[('Ubuntu',)] = JavaApt
+super(JavaDeb, JavaDeb).subclasses[('Ubuntu',)] = JavaDeb
 
 #############################################################################
 #############################################################################
 
-class JavaYum(Java):
+class JavaRhel(Java):
     # For later:
     # http://www.rackspace.com/knowledge_center/article/how-to-install-the-oracle-jdk-on-fedora-15-16
     # https://github.com/p120ph37/java-1.7.0-sun-compat
     
     def __init__(self, module):
-        super(JavaYum, self).__init__(module)
+        super(JavaRhel, self).__init__(module)
         self.yum = Yum(module)
 
     def install(self, target_state, target_version):
@@ -825,7 +825,7 @@ class JavaYum(Java):
             changed = self.yum.uninstall(pkg) or changed
         return changed
     
-super(JavaYum, JavaYum).subclasses[('Fedora',)] = JavaYum
+super(JavaRhel, JavaRhel).subclasses[('Fedora',)] = JavaRhel
 
 #############################################################################
 #############################################################################

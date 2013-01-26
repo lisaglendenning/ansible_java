@@ -357,6 +357,9 @@ class Java(object):
     
     JAVA_HOME = '/usr/lib/jvm'
     
+    ENV_FILE = '/etc/environment'
+    ENV_PATTERN = r"^[:space]*JAVA_HOME[:space]*="
+    
     # TODO: get latest versions dynamically
     LATEST_VERSION = { 
         7: JavaVersion(7, 0, 11, 21),
@@ -456,7 +459,58 @@ class Java(object):
         latest = cls.LATEST_VERSION[version.major]
         return os.path.join(cls.JAVA_HOME, 
                             ('jdk' if jdk else 'jre') + latest.version_string())
+            
+    @classmethod    
+    def install_env(cls, module, home):
+        pattern = cls.ENV_PATTERN
+        argv = ['grep', '-E', "%s" % pattern, cls.ENV_FILE]
+        result = module.run_command(argv)
+        if result[0] == 0:
+            output = [l for l in result[1].splitlines(True) if '=' in l]
+            assert len(output)
+            # assume that the latest value wins
+            kv = [w.strip() for w in output[-1].strip().split('=')]
+            assert kv[0] == 'JAVA_HOME'
+            if kv[1].strip('"') == home:
+                return False
+            
+            # delete existing JAVA_HOME
+            # it would be better to comment out, but unsure of file format
+            lines = []
+            with open(cls.ENV_FILE, 'r') as f:
+                for line in f:
+                    if line not in output:
+                        lines.append(line)
+            
+            with open(cls.ENV_FILE, 'w') as f:
+                f.writelines(lines)
+                
+        # append
+        with open('/etc/environment', 'a') as f:
+            f.write('JAVA_HOME="%s"\n' % home)
+        return True
     
+    @classmethod 
+    def uninstall_env(cls, module, home=''):
+        pattern = cls.ENV_PATTERN
+        if home:
+            pattern += r'[:space]*"?' + home + r'"?[:space]*$'
+        argv = ['grep', '-E', "%s" % pattern, cls.ENV_FILE]
+        result = module.run_command(argv)
+        if result[0] == 0:
+            output = [l for l in result[1].splitlines(True) if '=' in l]
+            assert len(output)
+            lines = []
+            with open(cls.ENV_FILE, 'r') as f:
+                for line in f:
+                    if line not in output:
+                        lines.append(line)
+            with open(cls.ENV_FILE, 'w') as f:
+                f.writelines(lines)
+            return True
+        else:
+            return False
+        
     @classmethod
     def fetch(cls, module, target_version, jdk=False, rpm=False):
         url = cls.oracle_url(target_version, jdk, rpm)
@@ -620,9 +674,6 @@ class JavaDeb(Java):
     JRE_REPO_KEY = '5CB26B26'
     JRE_REPO_FILE = '/etc/apt/sources.list.d/duinsoft.list'
     
-    ENV_FILE = '/etc/environment'
-    ENV_PATTERN = r"^[:space]*JAVA_HOME[:space]*="
-    
     @classmethod
     def java_home(cls, version, jdk=False):
         if jdk:
@@ -643,56 +694,7 @@ class JavaDeb(Java):
         super(JavaDeb, self).__init__(module)
         self.apt = Apt(module)
         self.aptrepo = AptRepository(module)
-            
-    def install_env(self, home):
-        pattern = self.ENV_PATTERN
-        argv = ['grep', '-E', "%s" % pattern, self.ENV_FILE]
-        result = self.module.run_command(argv)
-        if result[0] == 0:
-            output = [l for l in result[1].splitlines(True) if '=' in l]
-            assert len(output)
-            # assume that the latest value wins
-            kv = [w.strip() for w in output[-1].strip().split('=')]
-            assert kv[0] == 'JAVA_HOME'
-            if kv[1].strip('"') == home:
-                return False
-            
-            # delete existing JAVA_HOME
-            # it would be better to comment out, but unsure of file format
-            lines = []
-            with open(self.ENV_FILE, 'r') as f:
-                for line in f:
-                    if line not in output:
-                        lines.append(line)
-            
-            with open(self.ENV_FILE, 'w') as f:
-                f.writelines(lines)
-                
-        # append
-        with open('/etc/environment', 'a') as f:
-            f.write('JAVA_HOME="%s"\n' % home)
-        return True
-    
-    def uninstall_env(self, home=''):
-        pattern = self.ENV_PATTERN
-        if home:
-            pattern += r'[:space]*"?' + home + r'"?[:space]*$'
-        argv = ['grep', '-E', "%s" % pattern, self.ENV_FILE]
-        result = self.module.run_command(argv)
-        if result[0] == 0:
-            output = [l for l in result[1].splitlines(True) if '=' in l]
-            assert len(output)
-            lines = []
-            with open(self.ENV_FILE, 'r') as f:
-                for line in f:
-                    if line not in output:
-                        lines.append(line)
-            with open(self.ENV_FILE, 'w') as f:
-                f.writelines(lines)
-            return True
-        else:
-            return False
-        
+
     def install_jdk(self, target_version):
         changed = False
         repo = self.JDK_REPO
@@ -767,14 +769,14 @@ class JavaDeb(Java):
         else:
             raise ValueError(target_state)
         home = self.java_home(target_version, jdk)
-        changed = self.install_env(home) or changed
+        changed = self.install_env(self.module, home) or changed
         return changed
         
     def uninstall(self):
         changed = False
         changed = self.uninstall_jdk() or changed
         changed = self.uninstall_jre() or changed
-        changed = self.uninstall_env() or changed
+        changed = self.uninstall_env(self.module) or changed
         return changed
     
 super(JavaDeb, JavaDeb).subclasses[('Ubuntu',)] = JavaDeb
@@ -787,11 +789,18 @@ class JavaRhel(Java):
     # http://www.rackspace.com/knowledge_center/article/how-to-install-the-oracle-jdk-on-fedora-15-16
     # https://github.com/p120ph37/java-1.7.0-sun-compat
     
+    JAVA_HOME = '/usr/java'
+    
+    @classmethod
+    def java_home(cls):
+        return os.path.join(cls.JAVA_HOME, 'default')
+    
     def __init__(self, module):
         super(JavaRhel, self).__init__(module)
         self.yum = Yum(module)
 
     def install(self, target_state, target_version):
+        changed = False
         module = self.module
         jdk = target_state == 'jdk'
         rpm = True
@@ -813,9 +822,11 @@ class JavaRhel(Java):
                 argv = [source]
                 module.run_command(argv, True)
                 os.chdir(cwd)
-                assert os.path.exists(dest)
+            assert os.path.exists(dest)
             source = dest
-        changed = self.yum.install(source)
+        changed = self.yum.install(source) or changed
+        home = self.java_home()
+        changed = self.install_env(module, home) or changed
         return changed
         
     def uninstall(self):
@@ -823,6 +834,7 @@ class JavaRhel(Java):
         pkgs = ['jdk', 'jre']
         for pkg in pkgs:
             changed = self.yum.uninstall(pkg) or changed
+        changed = self.uninstall_env(self.module) or changed
         return changed
     
 super(JavaRhel, JavaRhel).subclasses[('Fedora',)] = JavaRhel

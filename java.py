@@ -550,7 +550,7 @@ class Java(object):
     def __init__(self, module):
         self.module = module
 
-    def install(self, target_state, target_version):
+    def install(self, target_state, target_version, result):
         module = self.module
         jdk = target_state=='jdk'
         rpm = False
@@ -588,36 +588,32 @@ class Java(object):
             argv = ['update-alternatives', '--set', cmd,
                     os.path.join(dest, 'bin', cmd),]
             module.run_command(argv, True)
-            
-        return True
+        
+        result['changed'] = True
+        return result
     
-    def uninstall(self, purge=False):
-        changed = False
+    def uninstall(self, result, purge=False):
         module = self.module
         dest = self.JAVA_HOME
         if purge:
             if os.path.exists(dest):
                 shutil.rmtree(dest)
-                changed = True
+                result['changed'] = True
             
         for cmd in ('java', 'javac',):
             argv = ['update-alternatives', '--list', cmd,]
-            result = module.run_command(argv)
-            if result[0] == 0:
-                for path in result[1].splitlines():
+            ret = module.run_command(argv)
+            if ret[0] == 0:
+                for path in ret[1].splitlines():
                     if path.startswith(dest):
                         argv = ['update-alternatives', '--remove', cmd, path,]
                         module.run_command(argv, True)
-                        changed = True
+                        result['changed'] = True
 
-        return changed
+        return result
     
     def apply(self):
         module = self.module
-        
-        result = {
-            'changed': False,
-        }
 
         current_state = 'none'
         current_version = self.discover_version(module, True)
@@ -627,6 +623,17 @@ class Java(object):
             current_version = self.discover_version(module, False)
             if current_version:
                 current_state = 'jre'
+        
+        result = {
+            'changed': False,
+            'state': current_state,
+            'version': '',
+            'java_home': '',
+        }
+        
+        if current_version:
+            result['version'] = current_version.version_string()
+            result['java_home'] = self.java_home(current_version, current_state == 'jdk')
         
         target_state = module.params['state']
         if target_state == 'none':
@@ -647,14 +654,18 @@ class Java(object):
         
         # uninstall current java
         if current_state != 'none':
-            result['changed'] = bool(self.uninstall()) or result['changed']
-#            current_version = self.discover_version(module, current_state == 'jdk')
-#            assert not current_version, current_version
-        
+            result = self.uninstall(result)
+            current_version = self.discover_version(module, current_state == 'jdk')
+            assert not current_version, current_version
+                    
         if target_state != 'none':
-            result['changed'] = bool(self.install(target_state, target_version)) or result['changed']
+            result = self.install(target_state, target_version, result)
             current_version = self.discover_version(module, target_state == 'jdk')
             assert current_version and current_version >= target_version, current_version
+    
+        result['state'] = target_state
+        result['version'] = current_version.version_string() if current_version else ''
+        result['java_home'] = self.java_home(current_version, target_state == 'jdk') if current_version else ''
         
         return result
 
@@ -695,7 +706,7 @@ class JavaDeb(Java):
         self.apt = Apt(module)
         self.aptrepo = AptRepository(module)
 
-    def install_jdk(self, target_version):
+    def install_jdk(self, target_version, result):
         changed = False
         repo = self.JDK_REPO
         changed = self.aptrepo.install(repo) or changed
@@ -706,18 +717,20 @@ class JavaDeb(Java):
                                "/usr/bin/debconf-set-selections"))
             self.module.run_command(args, True)
         changed = self.apt.install(pkg) or changed
-        return changed
+        result['changed'] = result['changed'] or changed
+        return result
     
-    def uninstall_jdk(self):
+    def uninstall_jdk(self, result):
         changed = False
         for version in self.arguments['version']['choices']:
             pkg = self.java_package(JavaVersion.from_string(version), True)
             changed = self.apt.uninstall(pkg) or changed
         repo = self.JDK_REPO
         changed = self.aptrepo.uninstall(repo) or changed
-        return changed
+        result['changed'] = result['changed'] or changed
+        return result
         
-    def install_jre(self, target_version):
+    def install_jre(self, target_version, result):
         changed = False
         if target_version.major == 7:
             if not os.path.isfile(self.JRE_REPO_FILE):
@@ -734,12 +747,13 @@ class JavaDeb(Java):
             pkg = self.java_package(target_version, False)
             changed = self.apt.install(pkg) or changed
         elif target_version.major == 6:
-            changed = super(JavaDeb, self).install('jre', target_version)
+            result = super(JavaDeb, self).install('jre', target_version, result)
         else:
             raise NotImplementedError
-        return changed
+        result['changed'] = result['changed'] or changed
+        return result
         
-    def uninstall_jre(self):
+    def uninstall_jre(self, result):
         changed = False
         for version in self.arguments['version']['choices']:
             pkg = self.java_package(JavaVersion.from_string(version), False)
@@ -753,31 +767,34 @@ class JavaDeb(Java):
         aptkey = AptKey(self.module)
         changed = aptkey.uninstall(self.JRE_REPO_KEY) or changed
         
-        changed = super(JavaDeb, self).uninstall() or changed
+        result = super(JavaDeb, self).uninstall(result)
 
-        return changed
+        result['changed'] = result['changed'] or changed
+        return result
     
-    def install(self, target_state, target_version):
-        changed = False
+    def install(self, target_state, target_version, result):
         self.apt.update()
         if target_state == 'jdk':
-            changed = self.install_jdk(target_version) or changed
+            result = self.install_jdk(target_version, result)
             jdk = True
         elif target_state == 'jre':
-            changed = self.install_jre(target_version) or changed
+            result = self.install_jre(target_version, result)
             jdk = False
         else:
             raise ValueError(target_state)
+        changed = False
         home = self.java_home(target_version, jdk)
         changed = self.install_env(self.module, home) or changed
-        return changed
+        result['changed'] = result['changed'] or changed
+        return result
         
-    def uninstall(self):
+    def uninstall(self, result):
         changed = False
-        changed = self.uninstall_jdk() or changed
-        changed = self.uninstall_jre() or changed
+        result = self.uninstall_jdk(result)
+        result = self.uninstall_jre(result)
         changed = self.uninstall_env(self.module) or changed
-        return changed
+        result['changed'] = result['changed'] or changed
+        return result
     
 super(JavaDeb, JavaDeb).subclasses[('Ubuntu',)] = JavaDeb
 
@@ -792,14 +809,14 @@ class JavaRhel(Java):
     JAVA_HOME = '/usr/java'
     
     @classmethod
-    def java_home(cls):
+    def java_home(cls, version=None, jdk=False):
         return os.path.join(cls.JAVA_HOME, 'default')
     
     def __init__(self, module):
         super(JavaRhel, self).__init__(module)
         self.yum = Yum(module)
 
-    def install(self, target_state, target_version):
+    def install(self, target_state, target_version, result):
         changed = False
         module = self.module
         jdk = target_state == 'jdk'
@@ -827,15 +844,17 @@ class JavaRhel(Java):
         changed = self.yum.install(source) or changed
         home = self.java_home()
         changed = self.install_env(module, home) or changed
-        return changed
+        result['changed'] = result['changed'] or changed
+        return result
         
-    def uninstall(self):
+    def uninstall(self, result):
         changed = False
         pkgs = ['jdk', 'jre']
         for pkg in pkgs:
             changed = self.yum.uninstall(pkg) or changed
         changed = self.uninstall_env(self.module) or changed
-        return changed
+        result['changed'] = result['changed'] or changed
+        return result
     
 super(JavaRhel, JavaRhel).subclasses[('Fedora',)] = JavaRhel
 

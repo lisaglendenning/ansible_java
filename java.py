@@ -9,6 +9,7 @@ description:
     - Manage installation of Oracle Java 6/7 on Linux.
 requirements:
     - wget
+    - alternatives, update-alternatives
 #version_added: null
 notes:
     - "Tested with Ansible v0.9."
@@ -53,39 +54,16 @@ from collections import namedtuple
 import subprocess
 
 #############################################################################
+# Utilities
 #############################################################################
 
-# Because it doesn't look like a module can call into other modules :(
-# so there's some duplicated effort going on here
+class PackageManager(object):
+    pass
 
-class Download(object):
-    
-    CMD = 'wget'
+#############################################################################
+#############################################################################
 
-    def __init__(self, module):
-        self.module = module
-    
-    def fetch(self, url, opts=None, destfile=None, destdir=None):
-        if destdir is None:
-            destdir = tempfile.gettempdir()
-        if destfile is None:
-            destfile = url.rsplit('/', 1)[1]
-        dest = os.path.join(destdir, destfile)
-        
-        if opts is None:
-            opts = ('-c', '--no-cookies')
-        
-        argv = [self.CMD]
-        argv.extend(opts)
-        argv.append(url)
-        argv.append('--output-document=%s' % dest)
-        result = self.module.run_command(argv)
-        if result[0] != 0:
-            raise RuntimeError('Error: Download returned %d: %s' % (result[0], argv))
-        
-        return dest
-    
-class Yum(object):
+class Yum(PackageManager):
     
     def __init__(self, module):
         self.module = module
@@ -115,7 +93,11 @@ class Yum(object):
         self.module.run_command(argv, True)
         return True
     
-class Apt(object):
+#############################################################################
+#############################################################################
+
+# mostly borrowed from ansible apt module code
+class Apt(PackageManager):
     CMD = 'apt-get'
     PATH = '/usr/bin'
     ENV = {
@@ -206,6 +188,7 @@ class Apt(object):
             result = True
         return result
     
+    # I'm not sure that this function works as intended...
     def update(self):
         argv = self.args()
         argv.extend(['-q', '-y'])
@@ -213,33 +196,39 @@ class Apt(object):
         result = self.module.run_command(' '.join(argv), True)
         return result
     
+#############################################################################
+#############################################################################
+
 class AptKey(object):
     CMD = 'apt-key'
     PATH = '/usr/bin'
     
-    def __init__(self, module):
-        self.module = module
-        
-    def installed(self, key):
-        args = "%s list | grep '%s'" % (os.path.join(self.PATH, self.CMD), key)
-        result = self.module.run_command(args)
+    @classmethod
+    def installed(cls, module, key):
+        args = "%s list | grep '%s'" % (os.path.join(cls.PATH, cls.CMD), key)
+        result = module.run_command(args)
         return len(result[1])
     
-    def install(self, key):
-        if self.installed(key):
+    @classmethod
+    def install(cls, module, key):
+        if cls.installed(module, key):
             return False
-        argv = [os.path.join(self.PATH, self.CMD), 'adv',
+        argv = [os.path.join(cls.PATH, cls.CMD), 'adv',
                 '--keyserver', 'keys.gnupg.net', '--recv-keys', key]
-        self.module.run_command(argv, True)
+        module.run_command(argv, True)
         return True
     
-    def uninstall(self, key):
-        if not self.installed(key):
+    @classmethod
+    def uninstall(cls, module, key):
+        if not cls.installed(module, key):
             return False
-        argv = [os.path.join(self.PATH, self.CMD), 'del', key]
-        self.module.run_command(argv, True)
+        argv = [os.path.join(cls.PATH, cls.CMD), 'del', key]
+        module.run_command(argv, True)
         return True
         
+#############################################################################
+#############################################################################
+
 class AptRepository(object):
     PACKAGE = 'python-software-properties'
     CMD = 'add-apt-repository'
@@ -323,11 +312,10 @@ class JavaVersion(namedtuple('JavaVersion', 'major, minor, release, build')):
 
         fields = m.groupdict()
         for k,v in fields.iteritems():
-            if v is not None:
-                fields[k] = int(v)
+            fields[k] = int(v) if v is not None else 0
         return cls(**fields)
     
-    def __new__(cls, major=None, minor=None, release=None, build=None):
+    def __new__(cls, major=0, minor=0, release=0, build=0):
         return super(JavaVersion, cls).__new__(cls, major, minor, release, build)
     
     def version_string(self):
@@ -339,6 +327,102 @@ class JavaVersion(namedtuple('JavaVersion', 'major, minor, release, build')):
     def build_string(self):
         return self.BUILD_TEMPLATE % self._asdict()
 
+#############################################################################
+#############################################################################
+
+class JavaEnv(object):
+
+    ENV_VAR = 'JAVA_HOME'
+    ENV_PATTERN = r"^[:space]*JAVA_HOME[:space]*="
+    
+    @classmethod    
+    def install(cls, module, distro, home):
+        changed = False
+        
+        # add home to system env file
+        do_append = True
+        pattern = cls.ENV_PATTERN
+        argv = ['grep', '-E', "%s" % pattern, distro.ENV_FILE]
+        result = module.run_command(argv)
+        if result[0] == 0:
+            output = [l for l in result[1].splitlines(True) if '=' in l]
+            assert len(output)
+            # assume that the latest value wins
+            kv = [w.strip() for w in output[-1].strip().split('=')]
+            assert kv[0] == cls.ENV_VAR
+            if kv[1].strip('"') == home:
+                # home already set to requested value
+                do_append = False
+            else:
+                # delete existing JAVA_HOME
+                # it would be better to comment out, but unsure of file format
+                lines = []
+                with open(distro.ENV_FILE, 'r') as f:
+                    for line in f:
+                        if line not in output:
+                            lines.append(line)
+                with open(distro.ENV_FILE, 'w') as f:
+                    f.writelines(lines)
+                changed = True
+        # append new value
+        if do_append:
+            with open(distro.ENV_FILE, 'a') as f:
+                f.write('%s="%s"\n' % (cls.ENV_VAR, home))
+            changed = True
+        
+        # update system alternatives
+        cmd = distro.ALTERNATIVES_CMD
+        for prog in ('java', 'javac',):
+            source = os.path.join(home, 'bin', prog)
+            if not os.path.exists(source):
+                continue
+            dest = os.path.join('/usr/bin', prog)
+            argv = [cmd, '--install', dest, prog, source, '1',]
+            module.run_command(argv, True)
+            argv = [cmd, '--set', prog, source,]
+            module.run_command(argv, True)
+            changed = True
+        
+        return changed
+    
+    @classmethod 
+    def uninstall(cls, module, distro, home=''):
+        changed = False
+        
+        # remove home from system env file
+        pattern = cls.ENV_PATTERN
+        if home:
+            pattern += r'[:space]*"?' + home + r'"?[:space]*$'
+        argv = ['grep', '-E', "%s" % pattern, distro.ENV_FILE]
+        result = module.run_command(argv)
+        if result[0] == 0:
+            output = [l for l in result[1].splitlines(True) if '=' in l]
+            assert len(output)
+            lines = []
+            with open(distro.ENV_FILE, 'r') as f:
+                for line in f:
+                    if line not in output:
+                        lines.append(line)
+            with open(distro.ENV_FILE, 'w') as f:
+                f.writelines(lines)
+            changed = True
+        
+        # update system alternatives
+        cmd = distro.ALTERNATIVES_CMD
+        # alternatives doesn't have --list
+        for prog in ('java', 'javac',):
+            args = ' '.join([cmd, '--display', prog,]) + " | grep -E '^/'"
+            result = module.run_command(args)
+            if result[0] == 0:
+                for line in result[1].splitlines():
+                    path = line.split()[0]
+                    if path.startswith(home):
+                        argv = [cmd, '--remove', prog, path,]
+                        module.run_command(argv, True)
+                        changed = True
+        
+        return changed
+        
 #############################################################################
 #############################################################################
 
@@ -354,11 +438,8 @@ class Java(object):
         6: { 'x64': {'rpm': 71304, 'bin': 71305,}, 
              'i586': {'rpm': 71302, 'bin': 71303,},},
     }
-    
-    JAVA_HOME = '/usr/lib/jvm'
-    
-    ENV_FILE = '/etc/environment'
-    ENV_PATTERN = r"^[:space]*JAVA_HOME[:space]*="
+    ORACLE_FILE_PATTERN = r'^(\w+)-(\w+)-linux-(\w+)((?:\.|-).+)$'
+    ORACLE_FILE_TEMPLATE = '%s-%s-linux-%s%s'
     
     # TODO: get latest versions dynamically
     LATEST_VERSION = { 
@@ -366,7 +447,7 @@ class Java(object):
         6: JavaVersion(6, 0, 38, 5),
     }
     
-    subclasses = {}
+    JAVA_HOME = '/usr/lib/jvm'
     
     arguments = {
         'state': {'default': 'jre', 'choices': ['none', 'jre', 'jdk',],},
@@ -374,27 +455,7 @@ class Java(object):
         'vendor': {'default': 'Oracle', 'choices': ['Oracle',],},
         'package_location': {'default': None,}
     }
-    
-    @classmethod
-    def select_subclass(cls):
-        plat = platform.system()
-        if plat == 'Linux':
-            try:
-                dist = platform.linux_distribution()[0].capitalize()
-            except:
-                # FIXME: MethodMissing, I assume?
-                dist = platform.dist()[0].capitalize()
-        else:
-            raise RuntimeError('Platform %s not supported' % plat)
 
-        subcls = None
-        for dists, subcls in cls.subclasses.iteritems():
-            if dist in dists:
-                break
-        else:
-            raise RuntimeError('Distribution %s not supported' % dist)
-        return subcls
-    
     @classmethod
     def discover_version(cls, module, jdk=False):
         version = None
@@ -420,8 +481,8 @@ class Java(object):
         return 'x64' if platform.machine() == 'x86_64' else 'i586'
     
     @classmethod
-    def sun_url(cls, target_version, rpm=False):
-        version = target_version.major
+    def sun_url(cls, version, rpm=False):
+        version = version.major
         if version not in cls.SUN_DOWNLOAD_IDS:
             raise NotImplementedError
         arch = cls.discover_arch()
@@ -440,19 +501,22 @@ class Java(object):
             suffix = '-rpm.bin' if rpm else '.bin'
         else:
             raise NotImplementedError
-        filename = '%s-%s-linux-%s%s' \
+        filename = cls.ORACLE_FILE_TEMPLATE \
             % (prefix, version.update_string(), arch, suffix)
         return filename
         
     @classmethod
-    def oracle_url(cls, target_version, jdk=False, rpm=False):
-        if target_version.major not in cls.LATEST_VERSION:
-            raise NotImplementedError
-        version = cls.LATEST_VERSION[target_version.major]
+    def oracle_url(cls, version, jdk=False, rpm=False):
         url = cls.ORACLE_DOWNLOAD_URL \
             + version.build_string() \
             + '/' + cls.oracle_file(version, jdk, rpm)
         return url
+    
+    @classmethod
+    def url(cls, version, jdk, rpm):
+        # for JRE, prefer sun url
+        return cls.oracle_url(version, jdk, rpm) \
+            if jdk else cls.sun_url(version, rpm)
     
     @classmethod
     def java_home(cls, version, jdk=False):
@@ -460,157 +524,128 @@ class Java(object):
         return os.path.join(cls.JAVA_HOME, 
                             ('jdk' if jdk else 'jre') + latest.version_string())
             
-    @classmethod    
-    def install_env(cls, module, home):
-        pattern = cls.ENV_PATTERN
-        argv = ['grep', '-E', "%s" % pattern, cls.ENV_FILE]
-        result = module.run_command(argv)
-        if result[0] == 0:
-            output = [l for l in result[1].splitlines(True) if '=' in l]
-            assert len(output)
-            # assume that the latest value wins
-            kv = [w.strip() for w in output[-1].strip().split('=')]
-            assert kv[0] == 'JAVA_HOME'
-            if kv[1].strip('"') == home:
-                return False
-            
-            # delete existing JAVA_HOME
-            # it would be better to comment out, but unsure of file format
-            lines = []
-            with open(cls.ENV_FILE, 'r') as f:
-                for line in f:
-                    if line not in output:
-                        lines.append(line)
-            
-            with open(cls.ENV_FILE, 'w') as f:
-                f.writelines(lines)
-                
-        # append
-        with open('/etc/environment', 'a') as f:
-            f.write('JAVA_HOME="%s"\n' % home)
-        return True
-    
-    @classmethod 
-    def uninstall_env(cls, module, home=''):
-        pattern = cls.ENV_PATTERN
-        if home:
-            pattern += r'[:space]*"?' + home + r'"?[:space]*$'
-        argv = ['grep', '-E', "%s" % pattern, cls.ENV_FILE]
-        result = module.run_command(argv)
-        if result[0] == 0:
-            output = [l for l in result[1].splitlines(True) if '=' in l]
-            assert len(output)
-            lines = []
-            with open(cls.ENV_FILE, 'r') as f:
-                for line in f:
-                    if line not in output:
-                        lines.append(line)
-            with open(cls.ENV_FILE, 'w') as f:
-                f.writelines(lines)
-            return True
-        else:
-            return False
-        
     @classmethod
-    def fetch(cls, module, target_version, jdk=False, rpm=False):
-        url = cls.oracle_url(target_version, jdk, rpm)
-        filename = url.rsplit('/', 1)[1]
+    def fetch_package(cls, module, distro, version, jdk=False, rpm=False, destdir=None):
+        filename = cls.oracle_file(version, jdk, rpm)
         
-        source = None
-        if module.params['package_location']:
-            source = module.params['package_location']
-            if source.startswith('/') and not source.endswith('/'):
-                source += '/'
+        # use custom location if specified
+        source = module.params['package_location']
+        if source:
+            if source.startswith('/'):
+                if not os.path.exists(source):
+                    raise ValueError("Non-existent path: %s" % source)
+                if os.path.isdir(source) and not source.endswith('/'):
+                    source += '/'
+            if source.endswith('/'):
+                source += filename
         else:
-            # for JRE, prefer sun url
-            if not jdk:
-                url = cls.sun_url(target_version, rpm)
-            source = url
-        if source.endswith('/'):
-            source += filename
+            source = cls.url(version, jdk, rpm)
         
         dest = None
         if source.startswith('/'): # assume local file
             dest = source
         else: # assume url
-            download = Download(module)
-            if url.startswith(cls.ORACLE_DOWNLOAD_URL):
+            if source.startswith(cls.ORACLE_DOWNLOAD_URL):
                 opts = ('-c', '--no-cookies', '--header', cls.ORACLE_COOKIE,)
             else:
                 opts = None
-            dest = download.fetch(source, opts=opts, destfile=filename)
+            dest = distro.download(module, source, opts=opts, destfile=filename, destdir=destdir)
+        assert os.path.exists(dest)
         return dest
-        
+    
     @classmethod
-    def main(cls, module, *args, **kwargs):
-        subcls = cls.select_subclass()
-        self = subcls(module, *args, **kwargs)
-        return self.apply()
-
-    def __init__(self, module):
-        self.module = module
-
-    def install(self, target_state, target_version, result):
-        module = self.module
-        jdk = target_state=='jdk'
-        rpm = False
-        source = self.fetch(module, target_version, jdk, rpm)
-        sourcedir = os.path.split(source)[0]
-        
-        dest = self.java_home(target_version, jdk)
-        destdir, destfile = os.path.split(dest)
-        o755 = stat.S_IRWXU | stat.S_IRGRP | stat.S_IXGRP | stat.S_IROTH | stat.S_IXOTH
-        if not os.path.exists(os.path.join(sourcedir, destfile)):
+    def extract_package(cls, module, distro, source, destdir=None):
+        assert os.path.exists(source), source
+        sourcedir, sourcefile = os.path.split(source)
+        m = re.match(cls.ORACLE_FILE_PATTERN, sourcefile)
+        if m is None:
+            # assume already extracted
+            return source
+        state, version, arch, suffix = m.groups()
+        version = JavaVersion.from_string(version)
+        if suffix in ('.tar.gz', '.bin'):
+            destfile = state + version.version_string()
+        elif suffix == '-rpm.bin':
+            destfile = sourcefile.replace('-rpm.bin', '.rpm')
+            # just to be difficult, the 64bit -rpm.bin from java.com
+            # turns into a file with amd64 in the name
+            if version.major == 6 and arch == 'x64':
+                destfile = destfile.replace('-x64.', '-amd64.')
+        else:
+            # assume already extracted
+            return source
+        if destdir is None:
+            destdir = sourcedir
+        if not os.path.isdir(destdir):
+            raise RuntimeError(destdir)
+        dest = os.path.join(destdir, destfile)
+        if not os.path.exists(dest):
             cwd = os.getcwd()
-            os.chdir(sourcedir)
-            if source.endswith('.bin'):
+            os.chdir(destdir)
+            if suffix.endswith('.bin'):
+                o755 = stat.S_IRWXU | stat.S_IRGRP | stat.S_IXGRP | stat.S_IROTH | stat.S_IXOTH
                 os.chmod(source, o755)
                 argv = [source]
                 module.run_command(argv, True)
-            elif source.endswith('.tar.gz'):
+            elif suffix == '.tar.gz':
                 argv = ['tar', 'xzf', source]
                 module.run_command(argv, True)
             else:
-                raise NotImplementedError
+                assert False, suffix
             os.chdir(cwd)
-        
-        source = os.path.join(sourcedir, destfile)
-        assert os.path.isdir(source)
-        if not os.path.isdir(destdir):
-            os.makedirs(destdir, o755)
-        if not os.path.exists(dest):
-            shutil.move(source, dest)
-        for cmd in (['java'] + (['javac'] if target_state == 'jdk' else [])):
-            argv = ['update-alternatives', '--install', 
-                    '/usr/bin/%s' % cmd, cmd,
-                    os.path.join(dest, 'bin', cmd), '1']
-            module.run_command(argv, True)
-            argv = ['update-alternatives', '--set', cmd,
-                    os.path.join(dest, 'bin', cmd),]
-            module.run_command(argv, True)
-        
-        result['changed'] = True
-        return result
-    
-    def uninstall(self, result, purge=False):
-        module = self.module
-        dest = self.JAVA_HOME
-        if purge:
-            if os.path.exists(dest):
-                shutil.rmtree(dest)
-                result['changed'] = True
+        assert os.path.exists(dest), dest
+        return dest
             
-        for cmd in ('java', 'javac',):
-            argv = ['update-alternatives', '--list', cmd,]
-            ret = module.run_command(argv)
-            if ret[0] == 0:
-                for path in ret[1].splitlines():
-                    if path.startswith(dest):
-                        argv = ['update-alternatives', '--remove', cmd, path,]
-                        module.run_command(argv, True)
-                        result['changed'] = True
+    @classmethod
+    def main(cls, module, *args, **kwargs):
+        distro = Distribution.discover(module)
+        subcls = distro.Java
+        self = subcls(module, distro, *args, **kwargs)
+        return self.apply()
 
-        return result
+    def __init__(self, module, distro):
+        self.module = module
+        self.distro = distro
+        self.packages = distro.PackageManager(module)
+
+    def install(self, state, version, rpm=False):
+        module = self.module
+        distro = self.distro
+        jdk = state=='jdk'
+        changed = False
+        
+        # fetch and extract source
+        destdir = self.JAVA_HOME
+        if not os.path.isdir(destdir):
+            o755 = stat.S_IRWXU | stat.S_IRGRP | stat.S_IXGRP | stat.S_IROTH | stat.S_IXOTH
+            os.makedirs(destdir, o755)
+            changed = True
+        source = self.fetch_package(module, distro, version, jdk, rpm, destdir)
+        dest = self.extract_package(module, distro, source, destdir)
+        if dest != source:
+            changed = True
+        
+        # install package
+        if rpm:
+            changed = self.packages.install(dest) or changed
+        
+        # update env
+        home = self.java_home(version, jdk)
+        changed = JavaEnv.install(module, distro, home) or changed
+        
+        return changed
+    
+    def uninstall(self, purge=False):
+        module = self.module
+        distro = self.distro
+        changed = False
+        if purge:
+            home = self.JAVA_HOME
+            if os.path.exists(home):
+                shutil.rmtree(home)
+                changed = True
+        changed = JavaEnv.uninstall(module, distro) or changed
+        return changed
     
     def apply(self):
         module = self.module
@@ -652,14 +687,17 @@ class Java(object):
             else:
                 return result
         
-        # uninstall current java
+        # uninstall existing java
         if current_state != 'none':
-            result = self.uninstall(result)
+            result['changed'] = self.uninstall() or result['changed']
             current_version = self.discover_version(module, current_state == 'jdk')
             assert not current_version, current_version
                     
         if target_state != 'none':
-            result = self.install(target_state, target_version, result)
+            # bump target version up to latest version
+            if target_version.major not in self.LATEST_VERSION:
+                raise NotImplementedError
+            result['changed'] = self.install(target_state, self.LATEST_VERSION[target_version.major]) or result['changed']
             current_version = self.discover_version(module, target_state == 'jdk')
             assert current_version and current_version >= target_version, current_version
     
@@ -672,7 +710,7 @@ class Java(object):
 #############################################################################
 #############################################################################
 
-# For JRE 6, I tried to use https://github.com/flexiondotorg/oab-java6
+# lg: For JRE 6, I tried to use https://github.com/flexiondotorg/oab-java6
 # but I ran into problems with ia32-libs on my test machine
 # so for now, JRE 6 install is manual
 class JavaDeb(Java):
@@ -700,104 +738,91 @@ class JavaDeb(Java):
         else:
             return 'update-sun-jre'
         return name
-        
-    def __init__(self, module):
-        super(JavaDeb, self).__init__(module)
-        self.apt = Apt(module)
-        self.aptrepo = AptRepository(module)
 
-    def install_jdk(self, target_version, result):
+    def install_jdk(self, version):
         changed = False
         repo = self.JDK_REPO
-        changed = self.aptrepo.install(repo) or changed
-        pkg = self.java_package(target_version, True)
-        if not self.apt.installed(pkg):
+        aptrepo = AptRepository(self.module)
+        changed = aptrepo.install(repo) or changed
+        pkg = self.java_package(version, True)
+        if not self.packages.installed(pkg):
             # accept Oracle license
             args = " | ".join(("echo %s shared/accepted-oracle-license-v1-1 select true" % pkg,
                                "/usr/bin/debconf-set-selections"))
             self.module.run_command(args, True)
-        changed = self.apt.install(pkg) or changed
-        result['changed'] = result['changed'] or changed
-        return result
+        changed = self.packages.install(pkg) or changed
+        return changed
     
-    def uninstall_jdk(self, result):
+    def uninstall_jdk(self):
         changed = False
         for version in self.arguments['version']['choices']:
             pkg = self.java_package(JavaVersion.from_string(version), True)
-            changed = self.apt.uninstall(pkg) or changed
+            changed = self.packages.uninstall(pkg) or changed
         repo = self.JDK_REPO
-        changed = self.aptrepo.uninstall(repo) or changed
-        result['changed'] = result['changed'] or changed
-        return result
+        aptrepo = AptRepository(self.module)
+        changed = aptrepo.uninstall(repo) or changed
+        return changed
         
-    def install_jre(self, target_version, result):
+    def install_jre(self, version):
         changed = False
-        if target_version.major == 7:
+        if version.major == 7:
             if not os.path.isfile(self.JRE_REPO_FILE):
                 with open(self.JRE_REPO_FILE, 'w') as f:
                     f.write(self.JRE_REPO)
                     f.write('\n')
                 changed = True
-        
-            aptkey = AptKey(self.module)
-            changed = aptkey.install(self.JRE_REPO_KEY) or changed
+
+            changed = AptKey.install(self.module, self.JRE_REPO_KEY) or changed
             if changed:
-                self.apt.update()
+                self.packages.update()
             
-            pkg = self.java_package(target_version, False)
-            changed = self.apt.install(pkg) or changed
-        elif target_version.major == 6:
-            result = super(JavaDeb, self).install('jre', target_version, result)
+            pkg = self.java_package(version, False)
+            changed = self.packages.install(pkg) or changed
+        elif version.major == 6:
+            changed = super(JavaDeb, self).install('jre', version) or changed
         else:
             raise NotImplementedError
-        result['changed'] = result['changed'] or changed
-        return result
+        return changed
         
-    def uninstall_jre(self, result):
+    def uninstall_jre(self):
         changed = False
         for version in self.arguments['version']['choices']:
             pkg = self.java_package(JavaVersion.from_string(version), False)
-            changed = self.apt.uninstall(pkg) or changed
+            changed = self.packages.uninstall(pkg) or changed
         
         if os.path.isfile(self.JRE_REPO_FILE):
             os.remove(self.JRE_REPO_FILE)
             changed = True
-            self.apt.update()
-            
-        aptkey = AptKey(self.module)
-        changed = aptkey.uninstall(self.JRE_REPO_KEY) or changed
-        
-        result = super(JavaDeb, self).uninstall(result)
+            self.packages.update()
 
-        result['changed'] = result['changed'] or changed
-        return result
+        changed = AptKey.uninstall(self.module, self.JRE_REPO_KEY) or changed
+        changed = super(JavaDeb, self).uninstall() or changed
+        return changed
     
-    def install(self, target_state, target_version, result):
-        self.apt.update()
-        if target_state == 'jdk':
-            result = self.install_jdk(target_version, result)
-            jdk = True
-        elif target_state == 'jre':
-            result = self.install_jre(target_version, result)
-            jdk = False
+    def install(self, state, version):
+        module = self.module
+        distro = self.distro
+        changed = False
+        
+        self.packages.update()
+        jdk = state == 'jdk'
+        if jdk:
+            changed = self.install_jdk(version) or changed
         else:
-            raise ValueError(target_state)
-        changed = False
-        home = self.java_home(target_version, jdk)
-        changed = self.install_env(self.module, home) or changed
-        result['changed'] = result['changed'] or changed
-        return result
+            changed = self.install_jre(version) or changed
+        home = self.java_home(version, jdk)
+        changed = JavaEnv.install(module, distro, home) or changed
+        return changed
         
-    def uninstall(self, result):
+    def uninstall(self):
+        module = self.module
+        distro = self.distro
         changed = False
-        result = self.uninstall_jdk(result)
-        result = self.uninstall_jre(result)
-        changed = self.uninstall_env(self.module) or changed
-        result['changed'] = result['changed'] or changed
-        return result
+        changed = self.uninstall_jdk() or changed
+        changed = self.uninstall_jre() or changed
+        changed = JavaEnv.uninstall(module, distro) or changed
+        return changed
     
-super(JavaDeb, JavaDeb).subclasses[('Ubuntu',)] = JavaDeb
-
 #############################################################################
 #############################################################################
 
@@ -811,52 +836,75 @@ class JavaRhel(Java):
     @classmethod
     def java_home(cls, version=None, jdk=False):
         return os.path.join(cls.JAVA_HOME, 'default')
-    
-    def __init__(self, module):
-        super(JavaRhel, self).__init__(module)
-        self.yum = Yum(module)
 
-    def install(self, target_state, target_version, result):
-        changed = False
-        module = self.module
-        jdk = target_state == 'jdk'
-        rpm = True
-        source = self.fetch(self.module, target_version, jdk, rpm)
-        if source.endswith('.bin'):
-            sourcedir, sourcefile = os.path.split(source)
-            # just to be difficult, the 64bit -rpm.bin from java.com
-            # turns into a file with amd64 in the name
-            if target_version.major == 6 and self.discover_arch() == 'x64':
-                destfile = sourcefile.replace('-x64-rpm.bin', '-amd64.rpm')
-            else:
-                destfile = sourcefile.replace('-rpm.bin', '.rpm')
-            dest = os.path.join(sourcedir, destfile)
-            if not os.path.exists(dest): 
-                o755 = stat.S_IRWXU | stat.S_IRGRP | stat.S_IXGRP | stat.S_IROTH | stat.S_IXOTH
-                os.chmod(source, o755)
-                cwd = os.getcwd()  
-                os.chdir(sourcedir)
-                argv = [source]
-                module.run_command(argv, True)
-                os.chdir(cwd)
-            assert os.path.exists(dest)
-            source = dest
-        changed = self.yum.install(source) or changed
-        home = self.java_home()
-        changed = self.install_env(module, home) or changed
-        result['changed'] = result['changed'] or changed
-        return result
+    def install(self, state, version):
+        return super(JavaRhel, self).install(state, version, True)
         
-    def uninstall(self, result):
+    def uninstall(self):
         changed = False
         pkgs = ['jdk', 'jre']
         for pkg in pkgs:
-            changed = self.yum.uninstall(pkg) or changed
-        changed = self.uninstall_env(self.module) or changed
-        result['changed'] = result['changed'] or changed
-        return result
+            changed = self.packages.uninstall(pkg) or changed
+        changed = JavaEnv.uninstall(self.module, self.distro) or changed
+        return changed
+
+#############################################################################
+# Distribution details
+#############################################################################
+
+class Distribution(object):
+    ENV_FILE = '/etc/environment'
+    DOWNLOAD_CMD = 'wget'
     
-super(JavaRhel, JavaRhel).subclasses[('Fedora',)] = JavaRhel
+    Java = Java
+    supported = {}
+    
+    @classmethod
+    def discover(cls, module):
+        # HACK FOR 0.9 BUG        
+        dist = get_distribution()() # module_common
+        if not dist:
+            raise RuntimeError('Platform not supported: %s' % get_platform()) # module_common
+        subcls = None
+        for dists, subcls in cls.supported.iteritems():
+            if dist in dists:
+                break
+        else:
+            raise RuntimeError('Distribution not supported: %s' % dist)
+        return subcls
+
+    @classmethod
+    def download(cls, module, source, opts=None, destfile=None, destdir=None):
+        if destdir is None:
+            destdir = tempfile.gettempdir()
+        if destfile is None:
+            destfile = source.rsplit('/', 1)[1]
+        dest = os.path.join(destdir, destfile)
+        
+        if opts is None:
+            opts = ('-c', '--no-cookies')
+        
+        argv = [cls.DOWNLOAD_CMD]
+        argv.extend(opts)
+        argv.append(source)
+        argv.append('--output-document=%s' % dest)
+        result = module.run_command(argv)
+        if result[0] != 0:
+            raise RuntimeError('Error: Download returned %d: %s' % (result[0], argv))
+        
+        return dest
+
+class DebDistribution(Distribution):
+    ALTERNATIVES_CMD = 'update-alternatives'
+    PackageManager = Apt
+    Java = JavaDeb
+super(DebDistribution, DebDistribution).supported[('Ubuntu',)] = DebDistribution
+
+class RhelDistribution(Distribution):
+    ALTERNATIVES_CMD = 'alternatives'
+    PackageManager = Yum
+    Java = JavaRhel
+super(RhelDistribution, RhelDistribution).supported[('Fedora',)] = RhelDistribution
 
 #############################################################################
 #############################################################################
@@ -905,7 +953,7 @@ def run_command(self, args, check_rc=False, close_fds=False, executable=None):
 def main():
     # hack for 0.9
     AnsibleModule.run_command = run_command
-    mod = AnsibleModule(argument_spec=Java.arguments)
+    mod = AnsibleModule(argument_spec=Java.arguments) # module_common
     try:
         result = Java.main(mod)
     except Exception:
@@ -913,6 +961,9 @@ def main():
         mod.fail_json(msg=msg)
     else:
         mod.exit_json(**result)
+
+#############################################################################
+#############################################################################
 
 # include magic from lib/ansible/module_common.py
 #<<INCLUDE_ANSIBLE_MODULE_COMMON>>

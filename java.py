@@ -12,7 +12,7 @@ requirements:
     - alternatives, update-alternatives
 #version_added: null
 notes:
-    - "Tested with Ansible v0.9."
+    - "Tested with Ansible v1.0."
     - "Tested on 64-bit Fedora 15,18 and Ubuntu 12."
     - "Undefined behavior if mixed with other Java installations."
 options:
@@ -49,9 +49,6 @@ import traceback
 import stat
 import shutil
 from collections import namedtuple
-
-# just for run_command hack
-import subprocess
 
 #############################################################################
 # Utilities
@@ -860,9 +857,8 @@ class Distribution(object):
     supported = {}
     
     @classmethod
-    def discover(cls, module):
-        # HACK FOR 0.9 BUG        
-        dist = get_distribution()() # module_common
+    def discover(cls, module): 
+        dist = get_distribution() # module_common
         if not dist:
             raise RuntimeError('Platform not supported: %s' % get_platform()) # module_common
         subcls = None
@@ -909,50 +905,7 @@ super(RhelDistribution, RhelDistribution).supported[('Fedora',)] = RhelDistribut
 #############################################################################
 #############################################################################
 
-# because Ansible 0.9 doesn't include this function
-def run_command(self, args, check_rc=False, close_fds=False, executable=None):
-    '''
-    Execute a command, returns rc, stdout, and stderr.
-    args is the command to run
-    If args is a list, the command will be run with shell=False.
-    Otherwise, the command will be run with shell=True when args is a string.
-    Other arguments:
-    - check_rc (boolean)  Whether to call fail_json in case of
-                          non zero RC.  Default is False.
-    - close_fds (boolean) See documentation for subprocess.Popen().
-                          Default is False.
-    - executable (string) See documentation for subprocess.Popen().
-                          Default is None.
-    '''
-    if isinstance(args, list):
-        shell = False
-    elif isinstance(args, basestring):
-        shell = True
-    else:
-        msg = "Argument 'args' to run_command must be list or string"
-        self.fail_json(rc=257, cmd=args, msg=msg)
-    rc = 0
-    msg = None
-    try:
-        cmd = subprocess.Popen(args,
-                               executable=executable,
-                               shell=shell,
-                               close_fds=close_fds,
-                               stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        out, err = cmd.communicate()
-        rc = cmd.returncode
-    except (OSError, IOError), e:
-        self.fail_json(rc=e.errno, msg=str(e), cmd=args)
-    except:
-        self.fail_json(rc=257, msg=traceback.format_exc(), cmd=args)
-    if rc != 0 and check_rc:
-        msg = err.rstrip()
-        self.fail_json(cmd=args, rc=rc, stdout=out, stderr=err, msg=msg)
-    return (rc, out, err)
-
 def main():
-    # hack for 0.9
-    AnsibleModule.run_command = run_command
     mod = AnsibleModule(argument_spec=Java.arguments) # module_common
     try:
         result = Java.main(mod)

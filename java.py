@@ -343,10 +343,10 @@ class JavaEnv(object):
         result = module.run_command(argv)
         if result[0] == 0:
             output = [l for l in result[1].splitlines(True) if '=' in l]
-            assert len(output)
+            assert len(output), output
             # assume that the latest value wins
             kv = [w.strip() for w in output[-1].strip().split('=')]
-            assert kv[0] == cls.ENV_VAR
+            assert kv[0] == cls.ENV_VAR, kv
             if kv[1].strip('"') == home:
                 # home already set to requested value
                 do_append = False
@@ -394,7 +394,7 @@ class JavaEnv(object):
         result = module.run_command(argv)
         if result[0] == 0:
             output = [l for l in result[1].splitlines(True) if '=' in l]
-            assert len(output)
+            assert len(output), output
             lines = []
             with open(distro.ENV_FILE, 'r') as f:
                 for line in f:
@@ -535,6 +535,8 @@ class Java(object):
                     source += '/'
             if source.endswith('/'):
                 source += filename
+                if not os.path.exists(source):
+                    raise ValueError("Non-existent package: %s" % source)
         else:
             source = cls.url(version, jdk, rpm)
         
@@ -547,7 +549,7 @@ class Java(object):
             else:
                 opts = None
             dest = distro.download(module, source, opts=opts, destfile=filename, destdir=destdir)
-        assert os.path.exists(dest)
+        assert os.path.exists(dest), dest
         return dest
     
     @classmethod

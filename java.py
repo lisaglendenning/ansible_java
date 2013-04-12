@@ -424,24 +424,24 @@ class JavaEnv(object):
 #############################################################################
 
 class Java(object):
-    
+
     # see https://forums.oracle.com/forums/thread.jspa?messageID=10563534
     ORACLE_COOKIE = 'Cookie: gpw_e24=http%3A%2F%2Fwww.oracle.com%2F'
     ORACLE_DOWNLOAD_URL = 'http://download.oracle.com/otn-pub/java/jdk/'
     SUN_DOWNLOAD_URL = 'http://javadl.sun.com/webapps/download/AutoDL?BundleId='
     SUN_DOWNLOAD_IDS = {
-        7: { 'x64': {'rpm': 73133, 'bin': 73134,}, 
-             'i586': {'rpm': 73131, 'bin': 73132,},},
-        6: { 'x64': {'rpm': 71304, 'bin': 71305,}, 
-             'i586': {'rpm': 71302, 'bin': 71303,},},
+        7: { 'x64': {'rpm': 75251, 'bin': 75252,}, 
+             'i586': {'rpm': 75249, 'bin': 75250,},},
+        6: { 'x64': {'rpm': 75079, 'bin': 75080,}, 
+             'i586': {'rpm': 75077, 'bin': 75078,},},
     }
     ORACLE_FILE_PATTERN = r'^(\w+)-(\w+)-linux-(\w+)((?:\.|-).+)$'
     ORACLE_FILE_TEMPLATE = '%s-%s-linux-%s%s'
     
     # TODO: get latest versions dynamically
     LATEST_VERSION = { 
-        7: JavaVersion(7, 0, 11, 21),
-        6: JavaVersion(6, 0, 38, 5),
+        7: JavaVersion(7, 0, 17, 2),
+        6: JavaVersion(6, 0, 43, 1),
     }
     
     JAVA_HOME = '/usr/lib/jvm'

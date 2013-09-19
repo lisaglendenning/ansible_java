@@ -18,7 +18,7 @@ notes:
 options:
     state:
         description:
-            - "whether to install JRE (I(jre)), install JDK (I(jdk)), or uninstall (I(none))"
+            - "whether to install JRE (C(jre)), install JDK (C(jdk)), or uninstall (C(none))"
         required: false
         default: jre
         choices: [none, jre, jdk]
@@ -33,9 +33,11 @@ options:
             - "non-standard location for packages"
         required: false
         default: None
-examples:
-    - code: "java state=jdk"
-      description: "Install the latest JDK."
+"""
+
+EXAMPLES = """
+# Install the latest JDK
+- java: state=jdk
 """
 
 #############################################################################
@@ -686,6 +688,11 @@ class Java(object):
             else:
                 return result
         
+        # short circuit for check mode
+        if module.check_mode:
+            result['changed'] = True
+            return result
+        
         # uninstall existing java
         if current_state != 'none':
             result['changed'] = self.uninstall() or result['changed']
@@ -908,7 +915,8 @@ super(RhelDistribution, RhelDistribution).supported[('Fedora',)] = RhelDistribut
 #############################################################################
 
 def main():
-    mod = AnsibleModule(argument_spec=Java.arguments) # module_common
+    mod = AnsibleModule(argument_spec=Java.arguments,
+                        supports_check_mode=True) # module_common
     try:
         result = Java.main(mod)
     except Exception:

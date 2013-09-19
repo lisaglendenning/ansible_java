@@ -4,16 +4,16 @@ DOCUMENTATION = """
 ---
 module: java
 author: Lisa Glendenning
-short_description: Manages installation of Oracle Java 6/7 on Linux
+short_description: Installs Oracle Java 7 on Ubuntu/Fedora.
 description:
-    - Manage installation of Oracle Java 6/7 on Linux.
+    - Installs Oracle Java 7 on Ubuntu/Fedora.
 requirements:
     - wget
     - alternatives, update-alternatives
 #version_added: null
 notes:
-    - "Tested with Ansible v1.0."
-    - "Tested on 64-bit Fedora 15,18 and Ubuntu 12."
+    - "Tested with Ansible v1.3."
+    - "Tested on 64-bit Fedora 14."
     - "Undefined behavior if mixed with other Java installations."
 options:
     state:
@@ -22,21 +22,15 @@ options:
         required: false
         default: jre
         choices: [none, jre, jdk]
-    version:
-        description:
-            - "Java version"
-        required: false
-        default: 7
-        choices: [6, 7]
     package_location:
         description:
-            - "non-standard location for packages"
+            - "non-standard URL or filesystem path to Java packages"
         required: false
         default: None
 """
 
 EXAMPLES = """
-# Install the latest JDK
+# Install the latest JDK.
 - java: state=jdk
 """
 
@@ -81,7 +75,7 @@ class Yum(PackageManager):
             pkg = name
         if self.installed(pkg):
             return False
-        argv = ['yum', '-y', 'install', name]
+        argv = ['yum', '--nogpgcheck', '-y', 'install', name]
         self.module.run_command(argv, True)
         return True
         
@@ -432,26 +426,21 @@ class Java(object):
     ORACLE_DOWNLOAD_URL = 'http://download.oracle.com/otn-pub/java/jdk/'
     SUN_DOWNLOAD_URL = 'http://javadl.sun.com/webapps/download/AutoDL?BundleId='
     SUN_DOWNLOAD_IDS = {
-        7: { 'x64': {'rpm': 75251, 'bin': 75252,}, 
-             'i586': {'rpm': 75249, 'bin': 75250,},},
-        6: { 'x64': {'rpm': 75079, 'bin': 75080,}, 
-             'i586': {'rpm': 75077, 'bin': 75078,},},
+        7: { 'x64': {'rpm': 80804, 'bin': 80805,}, 
+             'i586': {'rpm': 80802, 'bin': 80803,},},
     }
     ORACLE_FILE_PATTERN = r'^(\w+)-(\w+)-linux-(\w+)((?:\.|-).+)$'
     ORACLE_FILE_TEMPLATE = '%s-%s-linux-%s%s'
     
     # TODO: get latest versions dynamically
     LATEST_VERSION = { 
-        7: JavaVersion(7, 0, 17, 2),
-        6: JavaVersion(6, 0, 43, 1),
+        7: JavaVersion(7, 0, 40, 43),
     }
     
     JAVA_HOME = '/usr/lib/jvm'
     
     arguments = {
         'state': {'default': 'jre', 'choices': ['none', 'jre', 'jdk',],},
-        'version': {'default': '7', 'choices': ['6', '7',],},
-        'vendor': {'default': 'Oracle', 'choices': ['Oracle',],},
         'package_location': {'default': None,}
     }
 
@@ -494,12 +483,7 @@ class Java(object):
     def oracle_file(cls, version, jdk=False, rpm=False):
         arch = cls.discover_arch()
         prefix = 'jdk' if jdk else 'jre'
-        if version.major == 7:
-            suffix = '.rpm' if rpm else '.tar.gz'
-        elif version.major == 6:
-            suffix = '-rpm.bin' if rpm else '.bin'
-        else:
-            raise NotImplementedError
+        suffix = '.rpm' if rpm else '.tar.gz'
         filename = cls.ORACLE_FILE_TEMPLATE \
             % (prefix, version.update_string(), arch, suffix)
         return filename
@@ -566,12 +550,6 @@ class Java(object):
         version = JavaVersion.from_string(version)
         if suffix in ('.tar.gz', '.bin'):
             destfile = state + version.version_string()
-        elif suffix == '-rpm.bin':
-            destfile = sourcefile.replace('-rpm.bin', '.rpm')
-            # just to be difficult, the 64bit -rpm.bin from java.com
-            # turns into a file with amd64 in the name
-            if version.major == 6 and arch == 'x64':
-                destfile = destfile.replace('-x64.', '-amd64.')
         else:
             # assume already extracted
             return source
@@ -675,9 +653,7 @@ class Java(object):
         if target_state == 'none':
             target_version = None
         else:
-            target_version = JavaVersion.from_string(module.params['version'])
-            if target_version is None:
-                raise ValueError("Unable to parse Java version '%s'" % module.params['version'])
+            target_version = JavaVersion(7, 0, 0, 0)
         
         # are we done?
         if current_state == target_state:
@@ -691,22 +667,22 @@ class Java(object):
         # short circuit for check mode
         if module.check_mode:
             result['changed'] = True
-            return result
+            current_version = target_version
+        else:
+            # uninstall existing java
+            if current_state != 'none':
+                result['changed'] = self.uninstall() or result['changed']
+                current_version = self.discover_version(module, current_state == 'jdk')
+                assert not current_version, current_version
+                        
+            if target_state != 'none':
+                # bump target version up to latest version
+                if target_version.major not in self.LATEST_VERSION:
+                    raise NotImplementedError
+                result['changed'] = self.install(target_state, self.LATEST_VERSION[target_version.major]) or result['changed']
+                current_version = self.discover_version(module, target_state == 'jdk')
+                assert current_version and current_version >= target_version, current_version
         
-        # uninstall existing java
-        if current_state != 'none':
-            result['changed'] = self.uninstall() or result['changed']
-            current_version = self.discover_version(module, current_state == 'jdk')
-            assert not current_version, current_version
-                    
-        if target_state != 'none':
-            # bump target version up to latest version
-            if target_version.major not in self.LATEST_VERSION:
-                raise NotImplementedError
-            result['changed'] = self.install(target_state, self.LATEST_VERSION[target_version.major]) or result['changed']
-            current_version = self.discover_version(module, target_state == 'jdk')
-            assert current_version and current_version >= target_version, current_version
-    
         result['state'] = target_state
         result['version'] = current_version.version_string() if current_version else ''
         result['java_home'] = self.java_home(current_version, target_state == 'jdk') if current_version else ''
@@ -784,8 +760,6 @@ class JavaDeb(Java):
             
             pkg = self.java_package(version, False)
             changed = self.packages.install(pkg) or changed
-        elif version.major == 6:
-            changed = super(JavaDeb, self).install('jre', version) or changed
         else:
             raise NotImplementedError
         return changed

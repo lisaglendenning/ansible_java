@@ -13,7 +13,7 @@ requirements:
 #version_added: null
 notes:
     - "Tested with Ansible v1.3."
-    - "Tested on 64-bit Fedora 14."
+    - "Tested on 64-bit Fedora 16."
     - "Undefined behavior if mixed with other Java installations."
 options:
     state:
@@ -421,20 +421,16 @@ class JavaEnv(object):
 
 class Java(object):
 
-    # see https://forums.oracle.com/forums/thread.jspa?messageID=10563534
-    ORACLE_COOKIE = 'Cookie: gpw_e24=http%3A%2F%2Fwww.oracle.com%2F'
+    # see http://stackoverflow.com/questions/10268583/how-to-automate-download-and-installation-of-java-jdk-on-linux
+    ORACLE_COOKIE = 'Cookie: oraclelicense=accept-securebackup-cookie'
     ORACLE_DOWNLOAD_URL = 'http://download.oracle.com/otn-pub/java/jdk/'
-    SUN_DOWNLOAD_URL = 'http://javadl.sun.com/webapps/download/AutoDL?BundleId='
-    SUN_DOWNLOAD_IDS = {
-        7: { 'x64': {'rpm': 80804, 'bin': 80805,}, 
-             'i586': {'rpm': 80802, 'bin': 80803,},},
-    }
     ORACLE_FILE_PATTERN = r'^(\w+)-(\w+)-linux-(\w+)((?:\.|-).+)$'
     ORACLE_FILE_TEMPLATE = '%s-%s-linux-%s%s'
     
     # TODO: get latest versions dynamically
     LATEST_VERSION = { 
-        7: JavaVersion(7, 0, 40, 43),
+#        7: JavaVersion(7, 0, 72, 14),
+        7: JavaVersion(7, 0, 76, 13),
     }
     
     JAVA_HOME = '/usr/lib/jvm'
@@ -469,17 +465,6 @@ class Java(object):
         return 'x64' if platform.machine() == 'x86_64' else 'i586'
     
     @classmethod
-    def sun_url(cls, version, rpm=False):
-        version = version.major
-        if version not in cls.SUN_DOWNLOAD_IDS:
-            raise NotImplementedError
-        arch = cls.discover_arch()
-        suffix = 'rpm' if rpm else 'bin'
-        bundleid = cls.SUN_DOWNLOAD_IDS[version][arch][suffix]
-        url = cls.SUN_DOWNLOAD_URL + str(bundleid)
-        return url
-    
-    @classmethod
     def oracle_file(cls, version, jdk=False, rpm=False):
         arch = cls.discover_arch()
         prefix = 'jdk' if jdk else 'jre'
@@ -497,9 +482,7 @@ class Java(object):
     
     @classmethod
     def url(cls, version, jdk, rpm):
-        # for JRE, prefer sun url
-        return cls.oracle_url(version, jdk, rpm) \
-            if jdk else cls.sun_url(version, rpm)
+        return cls.oracle_url(version, jdk, rpm)
     
     @classmethod
     def java_home(cls, version, jdk=False):

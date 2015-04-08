@@ -1,1 +1,1 @@
-[Ansible](http://www.ansibleworks.com/) module for Oracle Java.
+[Ansible](http://www.ansible.com/) module for Oracle Java.
